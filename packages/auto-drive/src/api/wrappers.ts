@@ -33,7 +33,11 @@ const uploadFileChunks = async (
   for await (const chunk of asyncByChunk(asyncIterable, uploadChunkSize)) {
     await apiCalls.uploadFileChunk(api, { uploadId: fileUploadId, chunk, index })
     uploadBytes += chunk.length
-    onProgress?.(uploadBytes)
+    try {
+      onProgress?.(uploadBytes)
+    } catch {
+      // Prevent user callback errors from failing the upload
+    }
     index++
   }
 }
@@ -45,7 +49,12 @@ export const createApiInterface = (api: AutoDriveApiHandler): AutoDriveApi => {
     uploadChunkSize?: number,
   ): Promise<string> =>
     uploadFile(
-      { read: () => fileToIterable(file), name: file.name, size: file.size },
+      {
+        read: () => fileToIterable(file),
+        name: file.name,
+        size: file.size,
+        mimeType: file.type || undefined,
+      },
       options,
       uploadChunkSize,
     )
@@ -57,9 +66,22 @@ export const createApiInterface = (api: AutoDriveApiHandler): AutoDriveApi => {
   ): Promise<string> => {
     const { password = undefined, compression = true } = options
 
+    if (password !== undefined && password === '') {
+      throw new Error('Password cannot be empty')
+    }
+
     const { compressFile, CompressionAlgorithm, encryptFile, EncryptionAlgorithm } =
       await import('@autonomys/auto-dag-data')
-    let asyncIterable: AsyncIterable<Buffer> = file.read()
+
+    let rawBytesRead = 0
+    const trackingSource = async function* () {
+      for await (const chunk of file.read()) {
+        rawBytesRead += chunk.length
+        yield chunk
+      }
+    }
+
+    let asyncIterable: AsyncIterable<Buffer> = trackingSource()
 
     if (compression) {
       asyncIterable = compressFile(asyncIterable, {
@@ -88,18 +110,37 @@ export const createApiInterface = (api: AutoDriveApiHandler): AutoDriveApi => {
         : undefined,
     }
     const fileUpload = await apiCalls.createFileUpload(api, {
-      mimeType: lookupMimeType(file.name),
+      mimeType: file.mimeType ?? lookupMimeType(file.name),
       filename: file.name,
       uploadOptions,
     })
 
-    await uploadFileChunks(api, fileUpload.id, asyncIterable, uploadChunkSize, (bytes) => {
-      options.onProgress?.(progressToPercentage(bytes, file.size))
-    })
+    try {
+      await uploadFileChunks(api, fileUpload.id, asyncIterable, uploadChunkSize, () => {
+        try {
+          options.onProgress?.(progressToPercentage(rawBytesRead, file.size))
+        } catch {
+          // Ignore caller progress callback errors
+        }
+      })
 
-    const result = await apiCalls.completeUpload(api, { uploadId: fileUpload.id })
+      if (file.size === 0) {
+        try {
+          options.onProgress?.(100)
+        } catch {
+          // Ignore caller progress callback errors
+        }
+      }
 
-    return result.cid
+      const result = await apiCalls.completeUpload(api, { uploadId: fileUpload.id })
+
+      return result.cid
+    } catch (error) {
+      if (error && typeof error === 'object') {
+        Object.assign(error, { uploadId: fileUpload.id })
+      }
+      throw error
+    }
   }
 
   const uploadFileFromBuffer = async (
@@ -150,6 +191,10 @@ export const createApiInterface = (api: AutoDriveApiHandler): AutoDriveApi => {
       onProgress?: (progress: number) => void
     } = {},
   ): Promise<string> => {
+    if (password !== undefined && password === '') {
+      throw new Error('Password cannot be empty')
+    }
+
     const files = fileList instanceof FileList ? Array.from(fileList) : fileList
     const fileTree = constructFromInput(files)
 
@@ -189,14 +234,18 @@ export const createApiInterface = (api: AutoDriveApiHandler): AutoDriveApi => {
         {
           read: () => fileToIterable(file),
           name: file.name,
-          mimeType: lookupMimeType(file.name),
+          mimeType: (file instanceof File && file.type) || lookupMimeType(file.name),
           size: file.size,
           path: file.webkitRelativePath,
         },
         uploadChunkSize,
         {
           onProgress: (progress) => {
-            onProgress?.(progressToPercentage(currentBytesUploaded + progress, totalSize))
+            try {
+              onProgress?.(progressToPercentage(currentBytesUploaded + progress, totalSize))
+            } catch {
+              // Ignore caller progress callback errors
+            }
           },
         },
       )
@@ -217,16 +266,23 @@ export const createApiInterface = (api: AutoDriveApiHandler): AutoDriveApi => {
     const fileUpload = await apiCalls.createFileUploadWithinFolderUpload(api, {
       uploadId,
       name: file.name,
-      mimeType: file.mimeType,
+      mimeType: file.mimeType ?? lookupMimeType(file.name),
       relativeId: file.path,
       uploadOptions: {},
     })
 
-    await uploadFileChunks(api, fileUpload.id, file.read(), uploadChunkSize, options.onProgress)
+    try {
+      await uploadFileChunks(api, fileUpload.id, file.read(), uploadChunkSize, options.onProgress)
 
-    const result = await apiCalls.completeUpload(api, { uploadId: fileUpload.id })
+      const result = await apiCalls.completeUpload(api, { uploadId: fileUpload.id })
 
-    return result.cid
+      return result.cid
+    } catch (error) {
+      if (error && typeof error === 'object') {
+        Object.assign(error, { uploadId: fileUpload.id })
+      }
+      throw error
+    }
   }
 
   const downloadFile = async (cid: string, password?: string): Promise<AsyncIterable<Buffer>> => {
